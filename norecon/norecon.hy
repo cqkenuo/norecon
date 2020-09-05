@@ -23,6 +23,9 @@
         [glob [glob]]
         [project [*]]
         [shutil [which]]
+        [fnmatch [fnmatch]]
+        [dns [resolver reversename]]
+        [iploc [get-location]]
         )
 
 (setv bus (EventBus))
@@ -37,7 +40,7 @@
 
 ;;; gen resolvers
 (defn gen-resolvers
-  [&optional [force-update False] [timeout 5] [reliablity 0.8]]
+  [&optional [force-update False] [timeout 5] [reliablity 0.8] [verbose 0]]
   "生成resolvers,返回resolver文件路径"
   (logging.info "gen resolvers")
   (setv data-path (os.path.join (tempfile.gettempdir) "resolvers"))
@@ -49,6 +52,7 @@
     (subprocess.run [resolvers-bin
                      "-o" data-path
                      "-r" (str reliablity)
+                     "-v" (str verbose)
                      "-t" (str timeout)]
                     :encoding "utf-8"))
   data-path)
@@ -70,6 +74,7 @@
 
     (subprocess.run [whois-bin
                      "-o" out-path
+                     "-v" (str opts.verbose)
                      target]
                     :encoding "utf-8")))
 
@@ -80,12 +85,15 @@
     (setv out-dir (os.path.join opts.project-dir "record"))
     (os.makedirs out-dir :exist-ok True)
 
-    (when (not opts.overwrite)
-      (setv scan-domains (lfor d domains
-                               :if (-> (os.path.join out-dir f"{d}.json")
-                                       os.path.exists
-                                       not)
-                               d)))
+    (setv scan-domains
+          (lfor d domains
+                ;; 没有扫描过或进行覆盖
+                :if (or (not (-> (os.path.join out-dir f"{d}.json")
+                                 (os.path.exists)))
+                        opts.overwrite)
+                ;; 没有被排除
+                :if (not (exclude? d))
+                d))
 
     (unless (empty? scan-domains)
       (logging.info "record query, real scan: %s" scan-domains)
@@ -93,8 +101,9 @@
                        #* (if opts.resolvers
                               ["-r" opts.resolvers]
                               [])
-                       "--save-empty" "True"
+                       "--save-empty"
                        "-o" out-dir
+                       "-v" (str opts.verbose)
                        #* scan-domains
                        ]
                       :encoding "utf-8"))
@@ -153,15 +162,40 @@
                        "-report-out-name" f"{opts.screen-session}.html"
                        "-combine-sessions" sessions]))))
 
+(defn get-ip-host
+  [ip]
+  "根据ip地址反查域名"
+  (try
+    (some-> (reversename.from-address ip)
+            (resolver.query "PTR")
+            (first)
+            str)
+    (except [Exception]
+      "")))
+
+(defn get-net-name
+  [ip opts]
+  "获取`ip`的网络名"
+  (some-> (read-whois ip opts.project-dir)
+          (get-in ["network" "name"])))
+
+(setv cdn-names {"CLOUDFLARENET" "Cloudflare"
+                 "AKAMAI" "Akamai"
+                 "CHINANETCENTER" "ChinaNetCenter" ;;　网宿科技
+                 "AMAZO-CF" "CloudFront"})
+
+(defn cdn-name
+  [net-name]
+  "根据网络名获取对应的cdn名称"
+  (cdn-names.get net-name))
+
 (defn cdn-ip?
   [ip opts]
   "检测是否为cdn ip"
-  (setv net-name (-> (read-whois ip opts.project-dir)
-                     (get-in ["network" "name"])))
-  (in net-name ["CLOUDFLARENET"
-                "AKAMAI"
-                "CHINANETCENTER" ;; 网宿
-                ]))
+  (-> (get-net-name ip opts)
+      cdn-name
+      none?
+      not))
 
 (with-decorator (bus.on "new:ips")
   (defn ip-scan
@@ -172,20 +206,15 @@
 
     (defn send-screenshot
       [ip]
-      (setv info (read-ip ip opts.project-dir))
-      (when info
-        (bus.emit "new:screenshot" ip opts
-                  :ports (some->> (.get info "ports")
-                                  (map #%(.get %1 "port"))
-                                  (str.join ",")))))
+      (some-> (read-ip ip opts.project-dir)
+              (.get "ports")
+              (some->> (map #%(.get %1 "port"))
+                       (str.join ",")
+                       (bus.emit "new:screenshot" ip opts
+                                 :ports ))))
 
     (for [ip ips]
-      (when (-> (ipaddress.ip-address ip)
-                (. is-global)
-                not)
-        (logging.warn "ip scan 跳过非公开地址:%s." ip)
-        (continue))
-
+      ;; 检测是否已经扫描过
       (setv out-path f"{(os.path.join out-dir ip)}.json")
       (when (and (not opts.overwrite)
                  (os.path.exists out-path))
@@ -193,23 +222,58 @@
         (send-screenshot ip)
         (continue))
 
+      ;; 检测是否排除
+      (when (exclude? ip)
+        (logging.info "ip scan %s exclude!" ip)
+        (continue))
+
+      ;; 检测私有地址
+      (when (-> (ipaddress.ip-address ip)
+                (. is-global)
+                not)
+        (with [w (open out-path "w")]
+          (json.dump {"ip" ip
+                      "location" (get-location ip)}
+                     w :ensure-ascii False :indent 2 :sort-keys True :default str))
+        (logging.warn "ip scan 跳过非公开地址:%s." ip)
+        (continue))
+
+      ;; 注意必须放在cdn ip检测之前执行whois，否则无法正常检测
       (bus.emit "new:whois" ip opts)
 
-      ;; 空json文件进行占位，没有扫描结果的ip不再扫描
+      ;; 检测cdn ip
+      (setv ip-net-name (get-net-name ip opts))
+      (setv ip-info {"ip" ip
+                     "host" (get-ip-host ip)
+                     "location" (get-location ip)
+                     "net-name" ip-net-name
+                     "cdn-type" (cdn-name ip-net-name)})
+
+      ;; 写入基本信息进行占位，没有扫描结果的ip不再扫描
       (with [w (open out-path "w")]
-        (json.dump None w))
+        (json.dump ip-info w :ensure-ascii False :indent 2 :sort-keys True :default str))
 
-      (when (or (not (cdn-ip? ip opts))
-                opts.scan-cdn-ip)
-        (subprocess.run [nmap-bin
-                         "-t" (str opts.ip-scan-timeout)
-                         "-r" (str opts.masscan-rate)
-                         "-d" out-dir
-                         ip
-                         ]
-                        :encoding "utf-8")
+      (when (and (cdn-ip? ip opts)
+                 (not opts.scan-cdn-ip))
+        (logging.info "ip service scan skip cdn ip:%s." ip)
+        (continue))
 
-        (send-screenshot ip)))))
+      (logging.info "ip service scan:%s" ip)
+      (subprocess.run [nmap-bin
+                       "-t" (str opts.ip-scan-timeout)
+                       "-r" (str opts.masscan-rate)
+                       "-d" out-dir
+                       "-v" (str opts.verbose)
+                       ip
+                       ]
+                      :encoding "utf-8")
+
+      (-> (read-ip ip opts.project-dir)
+          (ip-info.update))
+
+      (with [w (open out-path "w")]
+        (json.dump ip-info w :ensure-ascii False :indent 2 :sort-keys True :default str))
+      (send-screenshot ip))))
 
 (with-decorator (bus.on "new:domain")
   (defn domain
@@ -236,6 +300,7 @@
     (subprocess.run [amass-bin
                      "-t" (str opts.amass-timeout)
                      "-o" amass-out
+                     "-v" (str opts.verbose)
                      root-domain]
                     :encoding "utf-8")
 
@@ -243,7 +308,9 @@
     (setv [_ subds-out] (tempfile.mkstemp ".txt" f"subds_{root-domain}_"))
     (subprocess.run [subfinder-bin
                      "-o" subds-out
+                     "-v" (str opts.verbose)
                      root-domain]
+                    :timeout 300
                     :encoding "utf-8")
 
     ;; 保存结果
@@ -273,13 +340,14 @@
 
   (import [attrdict [AttrDict :as adict]])
 
-  (setv opts (adict {"project_dir" "hackerone"
+  (setv opts (adict {"project_dir" "../hackerone"
                      "resolvers" "./resolv"
                      "amass_timeout" 1
                      "ip_scan_timeout" 500
                      "masscan_rate" 1000
                      "screen_session" "screen"
                      "overwrite" False
+                     "verbose" 2
                      "screenshot_timeout" 1000
                      "scan_cdn_ip" False}))
 
@@ -329,10 +397,19 @@
                 p)
             (raise (FileNotFoundError binary)))))
 
+(setv exclude-hosts [])
+
+(defn exclude? [host]
+  "是否被排除"
+  (for [e exclude-hosts]
+    (when (fnmatch host e)
+      (return True)))
+  (return False))
+
 (defmainf [&rest args]
   (setv opts (parse-args [["--amass-timeout"
                            :type int
-                           :default 5
+                           :default 60
                            :help "amass扫描超时时间(分) (default: %(default)s)"]
                           ["--ip-scan-timeout"
                            :type int
@@ -347,17 +424,20 @@
                            :default 1000
                            :help "masscan扫描速率 (default: %(default)s)"]
                           ["--scan-cdn-ip"
-                           :type bool
-                           :default False
+                           :action "store_true"
                            :help "是否对cdn ip进行端口扫描 (default: %(default)s)"]
                           ["--overwrite"
-                           :type bool
-                           :default False
+                           :action "store_true"
                            :help "是否强制重新扫描(如果为False,则扫描过的项目不再重新扫描) (default: %(default)s)"]
                           ["-ss" "--screen-session"
                            :type str
                            :default "screen"
                            :help "输出屏幕快照的session文件名 (default: %(default)s)"]
+                          ["-e" "--exclude"
+                           :nargs "?"
+                           :type (argparse.FileType "r")
+                           :default None
+                           :help "包含排除列表的文件,可以是域名或ip,支持glob格式匹配(*?)"]
                           ["-p" "--project-dir"
                            :type str
                            :required True
@@ -368,8 +448,10 @@
                            :default sys.stdin
                            :help "输入的目标"]
                           ["-v" "--verbose"
-                           :action "count"
-                           :default 0]
+                           :nargs "?"
+                           :type int
+                           :default 0
+                           :help "日志输出级别(0,1,2)　 (default: %(default)s)"]
                           ["target" :nargs "*" :help "要扫描的目标，可以是域名或ip地址"]
                           ]
                          (rest args)
@@ -390,7 +472,10 @@
 
   (setv targets (read-nargs-or-input-file opts.target opts.targets))
 
-  (->> (gen-resolvers)
+  (when opts.exclude
+    (setv exclude-hosts (read-valid-lines opts.exclude)))
+
+  (->> (gen-resolvers :verbose opts.verbose)
        (setv opts.resolvers))
 
   (defn network->ips

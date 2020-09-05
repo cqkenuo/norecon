@@ -33,6 +33,7 @@
                                 "-timeout" (str timeout)
                                 #* opts
                                 "-d" domain]
+                               :timeout (* 60 (inc timeout))
                                :encoding "utf-8"
                                :stdout subprocess.PIPE))
        (if (zero? r.returncode)
@@ -53,8 +54,10 @@
                            :default 30
                            :help "查询执行时间(分钟) (default: %(default)s)"]
                           ["-v" "--verbose"
-                           :action "count"
-                           :default 0]
+                           :nargs "?"
+                           :type int
+                           :default 0
+                           :help "日志输出级别(0,1,2)　 (default: %(default)s)"]
                           ["target" :help "目标"]]
                          (rest args)
                          :description "使用amass查询子域名"))

@@ -89,16 +89,10 @@
 
 (defmainf [&rest args]
   (setv opts (parse-args [["--reset"
-                           :type bool
-                           :default False
-                           :const True
-                           :nargs "?"
+                           :action "store_true"
                            :help "重置配置文件"]
                           ["-s" "--show-qrcode"
-                           :type bool
-                           :default False
-                           :const True
-                           :nargs "?"
+                           :action "store_true"
                            :help "显示二维码，进行关注"]
                           ["-t" "--content-type"
                            :default "text"
@@ -107,8 +101,10 @@
                            :nargs "?"
                            :help "发送的消息类型 (default: %(default)s)"]
                           ["-v" "--verbose"
-                           :action "count"
-                           :default 0]
+                           :nargs "?"
+                           :type int
+                           :default 0
+                           :help "日志输出级别(0,1,2)　 (default: %(default)s)"]
                           ["message" :nargs "?" :help "消息内容"]]
                          (rest args)
                          :description "发送微信消息"))
